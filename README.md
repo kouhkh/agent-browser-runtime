@@ -129,6 +129,13 @@ The following measurements were made on 2026-09-02 on the same Mac and Chrome
 | Local fixture, fresh managed tab then two warm navigations | Navigation 59.9/22.6/23.8 ms; DOM evaluate 36.6/14.2/29.0 ms | One-shot CDP total 11.6–35.9 ms across five runs (navigation 2.5–7.9 ms; evaluate 0.8–7.1 ms) | Only tens of milliseconds; both paths are already fast locally. |
 | Public test `/login`, fresh managed tab, explicit 10 s outer budget | No result before 10,000 ms; the browser call timed out and its kernel reset | One-shot CDP: first run 3,091 ms, then 116 ms and 66 ms; session runner: first navigation 4,112 ms, then 316 ms and 552 ms; warm DOM inspect about 1 ms (CLI wrapper about 29 ms) | In this sample, a warm check avoided at least 9.8 s of waiting; the first request avoided the managed timeout but still paid real page/network latency. |
 
+An HTTP GET-only profile of the same public `/login` page returned HTML in
+51.2 ms (time to first byte 40.9 ms). Crawling its 9 static assets sequentially
+took about 1.03 s and transferred 741,508 bytes; the largest assets were two
+JavaScript chunks of 222,191 and 199,865 bytes. This is a separate network
+baseline, not a browser result, but it shows why a 10-second managed-browser
+wait cannot be explained by page size alone.
+
 The public-page result is a timing observation, not a promise that every
 managed-browser call takes 10 or 30 seconds. The same managed Browser is fast
 for the local fixture, while the isolated runtime has explicit per-operation
