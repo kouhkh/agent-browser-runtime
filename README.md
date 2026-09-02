@@ -64,6 +64,7 @@ Structured error codes include `STALE_SESSION`, `SESSION_BUSY`, `CANCELLED`,
 scripts/browser_session_runner.mjs  reusable lifecycle-safe runtime
 scripts/direct_cdp_browser.mjs      one-shot CDP probe and timing output
 scripts/smoke_session_runner.mjs    local end-to-end smoke test
+LICENSE                             Apache License 2.0
 docs/architecture.md                design and migration boundary
 docs/skills/direct-cdp-browser.md   Codex skill adapter instructions
 ```
@@ -166,3 +167,10 @@ not every browser capability. A Playwright locator/interaction adapter and a
 separate control plane can be added later without changing the session
 contract. Neither would remove the need for explicit deadlines, cancellation,
 leases, and stale-session invalidation.
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See
+[`LICENSE`](LICENSE) for the complete terms. In short, the license permits
+commercial use, modification, and redistribution subject to its notice and
+attribution conditions; it also includes an explicit contributor patent grant.
