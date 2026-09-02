@@ -81,3 +81,81 @@ identity and authorization remain the caller's responsibility.
 
 See [`docs/architecture.md`](docs/architecture.md) for the control-plane and
 adapter design, including the path toward Playwright/CDP-backed test tooling.
+
+## Replacing the managed browser path
+
+This runtime can replace the Codex managed-browser execution path for a useful
+subset of coding-agent work: known URLs, health checks, repeatable read-only
+navigation, and DOM assertions. It is an execution-layer replacement, not a
+replacement for an existing signed-in browser session or for human UI review.
+
+The repeatable workflow is:
+
+```bash
+ROOT=$(mktemp -d)
+node scripts/browser_session_runner.mjs start \
+  --root "$ROOT" --session diagnosis --lease-ms 900000
+node scripts/browser_session_runner.mjs request \
+  --root "$ROOT" --session diagnosis --action health
+node scripts/browser_session_runner.mjs request \
+  --root "$ROOT" --session diagnosis --action navigate \
+  --url https://example.com --timeout-ms 5000
+node scripts/browser_session_runner.mjs request \
+  --root "$ROOT" --session diagnosis --action inspect --timeout-ms 5000
+node scripts/browser_session_runner.mjs stop \
+  --root "$ROOT" --session diagnosis
+```
+
+The `stop` response closes the control socket before Chrome's process-exit
+event is necessarily observed. If a caller wants to remove `ROOT`, wait until
+the recorded Chrome PID is gone and then delete this explicitly created
+directory; deleting it immediately can race Chrome's profile flush.
+
+Set `DIRECT_CDP_CHROME` for a non-default Chrome/Chromium installation. Keep
+the profile isolated; do not point the runner at a user's normal profile or
+copy cookies from the managed browser. A headed isolated profile can be used
+for a user to sign in manually, but that is a separate session and does not
+reuse Codex's in-app login.
+
+## Measured comparison
+
+The following measurements were made on 2026-09-02 on the same Mac and Chrome
+152.0.7977.65. The local fixture was a fixed HTML page served from
+`127.0.0.1:8765`; the remote target was the public Planora test environment
+`planora / 60.205.205.35`. All actions were read-only.
+
+| Scenario | Codex managed Browser | This runtime | What was saved |
+| --- | --- | --- | --- |
+| Local fixture, fresh managed tab then two warm navigations | Navigation 59.9/22.6/23.8 ms; DOM evaluate 36.6/14.2/29.0 ms | One-shot CDP total 11.6–35.9 ms across five runs (navigation 2.5–7.9 ms; evaluate 0.8–7.1 ms) | Only tens of milliseconds; both paths are already fast locally. |
+| Public test `/login`, fresh managed tab, explicit 10 s outer budget | No result before 10,000 ms; the browser call timed out and its kernel reset | One-shot CDP: first run 3,091 ms, then 116 ms and 66 ms; session runner: first navigation 4,112 ms, then 316 ms and 552 ms; warm DOM inspect about 1 ms (CLI wrapper about 29 ms) | In this sample, a warm check avoided at least 9.8 s of waiting; the first request avoided the managed timeout but still paid real page/network latency. |
+
+The public-page result is a timing observation, not a promise that every
+managed-browser call takes 10 or 30 seconds. The same managed Browser is fast
+for the local fixture, while the isolated runtime has explicit per-operation
+deadlines and does not inherit the outer 30,000 ms bridge cutoff. Re-run the
+commands above on the target machine before using the numbers as an SLA.
+
+## When it does and does not replace Codex Browser
+
+Use this runtime by default for:
+
+- authenticated-free health and metadata checks after the caller has verified
+  the exact environment;
+- known-page navigation and visible-DOM extraction;
+- repeated coding-agent tests where a stale tab must fail fast and be rebuilt;
+- timing comparisons that need page/network bytes separated from bridge cost.
+
+Keep the managed Browser for:
+
+- an existing Codex/in-app login session (this runtime deliberately cannot
+  read or copy it);
+- user-visible screenshots, manual sign-in, confirmation, or other human
+  handoff steps;
+- interactions not yet represented by the read-only `navigate`/`inspect`
+  contract.
+
+The current implementation therefore replaces the *standalone execution path*,
+not every browser capability. A Playwright locator/interaction adapter and a
+separate control plane can be added later without changing the session
+contract. Neither would remove the need for explicit deadlines, cancellation,
+leases, and stale-session invalidation.
