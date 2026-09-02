@@ -7,13 +7,16 @@ description: Use an isolated local Chrome over direct CDP for fast, read-only pa
 
 This adapter starts an isolated Chrome profile and talks to the Chrome DevTools
 Protocol directly. It is intended for coding-agent diagnostics and repeatable
-web checks; it is not a replacement for a managed browser when an existing
-signed-in session is required.
+web checks. An explicitly shared headed session can also hold a deliberately
+selected test-account login; it still never reads or copies a managed-browser
+profile.
 
 ## Scope and safety
 
 - Use a temporary, isolated Chrome profile. Never read or copy cookies,
   storage, passwords, or an existing profile.
+- For login reuse, use `--shared` to create a new persistent profile owned by
+  this runtime. Never point it at a normal Chrome profile.
 - Keep operations read-only. The included helpers only navigate and inspect
   visible DOM state.
 - Verify the exact target environment and host identity before checking a
@@ -53,7 +56,31 @@ node scripts/browser_session_runner.mjs stop --session diagnosis
 Set `DIRECT_CDP_CHROME` when Chrome is not at the macOS default path. Set
 `DIRECT_CDP_SESSION_ROOT` to choose where session state and the isolated
 profile are stored. Pass `--headed` only when a user must sign in manually to
-this dedicated profile.
+this dedicated profile. For a profile shared by local agent tasks:
+
+```bash
+node scripts/browser_session_runner.mjs start \
+  --shared --headed --session planora-test --lease-ms 86400000
+# User signs in in the opened window, then verify a non-login page marker:
+node scripts/browser_session_runner.mjs request \
+  --shared --session planora-test --action auth-check \
+  --url https://test.example/dashboard --contains "项目"
+```
+
+If any caller sees expiry, it records one condition and waits for the user to
+complete the sign-in; it must not retry the business request in a loop:
+
+```bash
+node scripts/browser_session_runner.mjs request \
+  --shared --session planora-test --action auth-required \
+  --agent worker-2 --reason session_expired
+node scripts/browser_session_runner.mjs request \
+  --shared --session planora-test --action wait-auth --timeout-ms 120000
+```
+
+The coordinator confirms the new login with `auth-check`. The state file's
+`auth.epoch` changes only when a required/unknown session becomes ready, so
+other tasks can detect one coordinated re-login without sharing credentials.
 
 ## Lifecycle and timeout rules
 
@@ -65,7 +92,8 @@ this dedicated profile.
   fresh session for a retry.
 - The runner never retries a failed operation automatically.
 - Supported actions are deliberately limited to `health`, `navigate`,
-  `inspect`, `cancel`, and `close`.
+  `inspect`, `auth-status`, `auth-required`, `auth-check`, `auth-ready`,
+  `wait-auth`, `cancel`, and `close`.
 
 If direct CDP is fast while a managed browser is slow, the evidence points to
 the managed bridge/service path rather than page/network work. If direct CDP is

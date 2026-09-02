@@ -10,14 +10,15 @@
 
 import { spawn } from "node:child_process";
 import { createServer, connect as connectSocket } from "node:net";
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const DEFAULT_ROOT = join(tmpdir(), "agent-browser-sessions");
+const DEFAULT_SHARED_ROOT = join(homedir(), ".agent-browser-runtime", "sessions");
 const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 function parseArgs(argv) {
@@ -25,7 +26,14 @@ function parseArgs(argv) {
     command: argv[0] || "help",
     session: null,
     root: process.env.DIRECT_CDP_SESSION_ROOT || DEFAULT_ROOT,
+    rootExplicit: Boolean(process.env.DIRECT_CDP_SESSION_ROOT),
+    shared: false,
     url: null,
+    contains: null,
+    authCheckUrl: null,
+    authCheckContains: null,
+    agent: null,
+    reason: null,
     action: null,
     operationId: null,
     timeoutMs: 5000,
@@ -36,8 +44,14 @@ function parseArgs(argv) {
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--session") out.session = argv[++i];
-    else if (arg === "--root") out.root = argv[++i];
+    else if (arg === "--root") { out.root = argv[++i]; out.rootExplicit = true; }
+    else if (arg === "--shared") out.shared = true;
     else if (arg === "--url") out.url = argv[++i];
+    else if (arg === "--contains") out.contains = argv[++i];
+    else if (arg === "--auth-check-url") out.authCheckUrl = argv[++i];
+    else if (arg === "--auth-check-contains") out.authCheckContains = argv[++i];
+    else if (arg === "--agent") out.agent = argv[++i];
+    else if (arg === "--reason") out.reason = argv[++i];
     else if (arg === "--action") out.action = argv[++i];
     else if (arg === "--operation-id") out.operationId = argv[++i];
     else if (arg === "--timeout-ms") out.timeoutMs = Math.max(250, Number(argv[++i] || 5000));
@@ -52,6 +66,7 @@ function parseArgs(argv) {
   if (out.session && !SESSION_RE.test(out.session)) {
     throw new Error("Invalid session name; use 1-64 letters, numbers, _ or -");
   }
+  if (out.shared && !out.rootExplicit) out.root = DEFAULT_SHARED_ROOT;
   return out;
 }
 
@@ -68,6 +83,32 @@ function socketPath(options) {
   return join(sessionDir(options), "control.sock");
 }
 
+function lockPath(options) {
+  return join(sessionDir(options), "session.lock");
+}
+
+class SessionLockError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SessionLockError";
+  }
+}
+
+function authRecord(options) {
+  return {
+    status: "unknown",
+    epoch: 0,
+    reason: null,
+    requestedAt: null,
+    requestedBy: null,
+    authenticatedAt: null,
+    authenticatedBy: null,
+    lastCheckedAt: null,
+    checkUrl: options.authCheckUrl || null,
+    checkContains: options.authCheckContains || null,
+  };
+}
+
 function readState(options) {
   const path = statePath(options);
   if (!existsSync(path)) throw new Error(`Session state not found: ${path}`);
@@ -76,7 +117,9 @@ function readState(options) {
 
 function writeState(dir, state) {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "state.json"), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  const path = join(dir, "state.json");
+  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  try { chmodSync(path, 0o600); } catch { /* best effort on platforms without chmod */ }
 }
 
 function sleep(ms) {
@@ -284,6 +327,8 @@ class BrowserSession {
     this.options = options;
     this.dir = sessionDir(options);
     this.socketFile = socketPath(options);
+    this.lockFile = lockPath(options);
+    this.lockFd = null;
     this.state = {
       schemaVersion: 1,
       sessionId: options.session,
@@ -293,10 +338,14 @@ class BrowserSession {
       lastSeenAt: new Date().toISOString(),
       leaseExpiresAt: new Date(Date.now() + options.leaseMs).toISOString(),
       socketPath: this.socketFile,
+      lockPath: this.lockFile,
       pid: null,
       port: null,
       targetId: null,
       profileDir: join(this.dir, "profile"),
+      profileMode: options.shared ? "shared" : "ephemeral",
+      headed: Boolean(options.headed),
+      auth: authRecord(options),
       busy: false,
       activeOperationIds: [],
       staleReason: null,
@@ -324,8 +373,143 @@ class BrowserSession {
     writeState(this.dir, this.state);
   }
 
+  authStatus() {
+    return {
+      ok: this.state.auth?.status === "ready",
+      status: this.state.auth?.status || "unknown",
+      sessionId: this.state.sessionId,
+      profileMode: this.state.profileMode,
+      auth: this.state.auth || authRecord(this.options),
+    };
+  }
+
+  requireAuth(reason = "caller_requested", requestedBy = "unknown") {
+    const current = this.state.auth || authRecord(this.options);
+    const changed = current.status !== "required";
+    const auth = {
+      ...current,
+      status: "required",
+      reason,
+      requestedAt: changed ? new Date().toISOString() : current.requestedAt,
+      requestedBy: changed ? requestedBy : current.requestedBy,
+      lastCheckedAt: new Date().toISOString(),
+    };
+    this.save({ auth });
+    return {
+      ok: false,
+      status: "auth_required",
+      errorCode: "AUTH_REQUIRED",
+      sessionId: this.state.sessionId,
+      auth,
+      message: "Manual sign-in is required in the dedicated headed Chrome session; callers must wait for auth-ready instead of retrying the page.",
+    };
+  }
+
+  markAuthReady(authenticatedBy = "manual_login", extra = {}) {
+    const current = this.state.auth || authRecord(this.options);
+    const verified = Boolean(extra.verified);
+    const { verified: _verified, ...authExtra } = extra;
+    if (current.status !== "required" && !verified) {
+      return {
+        ok: false,
+        status: "auth_ready_rejected",
+        errorCode: "AUTH_READY_NOT_REQUESTED",
+        sessionId: this.state.sessionId,
+        auth: current,
+        message: "Marking a login ready requires an auth-required state; use auth-check to verify a fresh session.",
+      };
+    }
+    const newlyAuthenticated = current.status !== "ready";
+    const auth = {
+      ...current,
+      ...authExtra,
+      status: "ready",
+      epoch: Number(current.epoch || 0) + (newlyAuthenticated ? 1 : 0),
+      reason: null,
+      requestedAt: current.requestedAt,
+      requestedBy: current.requestedBy,
+      authenticatedAt: new Date().toISOString(),
+      authenticatedBy,
+      lastCheckedAt: new Date().toISOString(),
+    };
+    this.save({ auth });
+    return { ok: true, status: "authenticated", sessionId: this.state.sessionId, auth };
+  }
+
+  async waitForAuth(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const status = this.state.auth?.status || "unknown";
+      if (status === "ready") return this.authStatus();
+      await sleep(Math.min(250, Math.max(25, deadline - Date.now())));
+      try {
+        const latest = readState(this.options);
+        if (latest.auth) this.state.auth = latest.auth;
+      } catch {
+        // The session may be transitioning during a restart.
+      }
+    }
+    return {
+      ok: false,
+      status: "auth_wait_timeout",
+      errorCode: "AUTH_WAIT_TIMEOUT",
+      sessionId: this.state.sessionId,
+      auth: this.state.auth || authRecord(this.options),
+    };
+  }
+
+  observeAuth(page) {
+    if (this.state.profileMode !== "shared" || !page) return null;
+    const loginLike = typeof page.url === "string" && /\/login(?:[/?#]|$)/i.test(page.url);
+    if (loginLike) {
+      return this.requireAuth("login_page_detected", "runtime");
+    }
+    return null;
+  }
+
+  acquireLock() {
+    const writeLock = () => {
+      this.lockFd = openSync(this.lockFile, "wx", 0o600);
+      writeFileSync(this.lockFd, `${process.pid}\n`, { encoding: "utf8" });
+      try { chmodSync(this.lockFile, 0o600); } catch { /* best effort on platforms without chmod */ }
+    };
+    try {
+      writeLock();
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    let ownerPid = null;
+    try { ownerPid = Number(readFileSync(this.lockFile, "utf8").trim()); } catch { /* stale or unreadable lock */ }
+    if (isAlive(ownerPid)) {
+      throw new SessionLockError(`Session is already owned by process ${ownerPid}: ${this.options.session}`);
+    }
+    try { unlinkSync(this.lockFile); } catch { /* another starter may have won the race */ }
+    try {
+      writeLock();
+    } catch (error) {
+      if (error.code === "EEXIST") throw new SessionLockError(`Session lock is held: ${this.options.session}`);
+      throw error;
+    }
+  }
+
+  releaseLock() {
+    if (this.lockFd != null) {
+      try { closeSync(this.lockFd); } catch { /* already closed */ }
+      this.lockFd = null;
+    }
+    try { unlinkSync(this.lockFile); } catch { /* already gone */ }
+  }
+
   async start() {
     mkdirSync(this.dir, { recursive: true });
+    this.acquireLock();
+    try {
+      const previous = readState(this.options);
+      if (previous.auth) this.state.auth = previous.auth;
+    } catch {
+      // First start has no prior state to preserve.
+    }
     if (existsSync(this.socketFile)) {
       try { unlinkSync(this.socketFile); } catch { /* stale socket */ }
     }
@@ -369,6 +553,7 @@ class BrowserSession {
       this.server.once("error", reject);
       this.server.listen(this.socketFile, () => resolve());
     });
+    try { chmodSync(this.socketFile, 0o600); } catch { /* best effort on platforms without chmod */ }
     this.heartbeat = setInterval(() => { void this.checkLeaseAndProcess(); }, 2000);
     this.heartbeat.unref?.();
     this.save({ status: "ready", state: "ready" });
@@ -444,13 +629,30 @@ class BrowserSession {
     if (action === "health") return this.health();
     if (action === "cancel") return this.cancel(body.operationId || body.targetOperationId);
     if (action === "close") { await this.close(); return { ok: true, status: "closed" }; }
+    if (action === "auth-status") return this.authStatus();
+    if (action === "auth-required") {
+      return this.requireAuth(body.reason || "caller_requested", body.agent || "unknown");
+    }
+    if (action === "auth-ready") {
+      return this.markAuthReady(body.agent || "manual_login", {
+        checkUrl: body.url || this.state.auth?.checkUrl || null,
+        checkContains: body.contains || this.state.auth?.checkContains || null,
+      });
+    }
+    if (action === "wait-auth") {
+      const waitMs = Math.min(Math.max(250, Number(body.timeoutMs || this.options.timeoutMs)), 120000);
+      return await this.waitForAuth(waitMs);
+    }
     if (this.invalidated || !this.cdp || this.cdp.closed || (this.state.status !== "ready" && this.state.status !== "busy")) {
       return { ok: false, status: "stale", errorCode: "STALE_SESSION", staleReason: this.state.staleReason };
     }
     if (this.operation) {
       return { ok: false, status: "busy", errorCode: "SESSION_BUSY", activeOperationIds: [this.operation.id] };
     }
-    if (!["navigate", "inspect"].includes(action)) {
+    if (this.state.profileMode === "shared" && this.state.auth?.status === "required" && action !== "auth-check") {
+      return this.requireAuth(this.state.auth.reason || "session_expired", this.state.auth.requestedBy || "runtime");
+    }
+    if (!["navigate", "inspect", "auth-check"].includes(action)) {
       return { ok: false, status: "rejected", errorCode: "READ_ONLY_ACTION", message: `Unsupported action: ${action}` };
     }
     const timeoutMs = Math.min(Math.max(250, Number(body.timeoutMs || this.options.timeoutMs)), 120000);
@@ -466,8 +668,29 @@ class BrowserSession {
     try {
       const result = action === "navigate"
         ? await this.navigate(body.url, body.waitUntil || "load", timeoutMs, controller.signal)
-        : await this.inspect(timeoutMs, controller.signal);
-      return { ok: true, status: "succeeded", operationId, elapsedMs: Date.now() - operation.startedAt, result };
+        : action === "auth-check"
+          ? await this.navigate(body.url || this.state.auth?.checkUrl, body.waitUntil || "load", timeoutMs, controller.signal)
+          : await this.inspect(timeoutMs, controller.signal);
+      if (action === "auth-check") {
+        const contains = body.contains || this.state.auth?.checkContains;
+        const hasExpectedText = !contains || result?.visibleText?.includes(contains);
+        const loginLike = typeof result?.url === "string" && /\/login(?:[/?#]|$)/i.test(result.url);
+        if (!hasExpectedText || loginLike) {
+          return {
+            ...this.requireAuth(loginLike ? "login_page_detected" : "auth_marker_missing", body.agent || "auth-check"),
+            result,
+          };
+        }
+        return {
+          ...this.markAuthReady(body.agent || "auth-check", { verified: true, checkUrl: body.url || this.state.auth?.checkUrl || null, checkContains: contains || null }),
+          operationId,
+          elapsedMs: Date.now() - operation.startedAt,
+          result,
+        };
+      }
+      const authRequired = this.observeAuth(result);
+      if (authRequired) return { ...authRequired, operationId, elapsedMs: Date.now() - operation.startedAt, result };
+      return { ok: true, status: "succeeded", operationId, elapsedMs: Date.now() - operation.startedAt, authEpoch: this.state.auth?.epoch || 0, result };
     } catch (error) {
       const cancelled = controller.signal.aborted && !operation.timedOut;
       return {
@@ -500,6 +723,9 @@ class BrowserSession {
       pid: this.state.pid,
       targetId: this.state.targetId,
       state: this.state.state,
+      profileMode: this.state.profileMode,
+      headed: this.state.headed,
+      auth: this.state.auth || authRecord(this.options),
       staleReason: this.state.staleReason,
       busy: Boolean(this.operation),
       leaseExpiresAt: this.state.leaseExpiresAt,
@@ -583,6 +809,7 @@ class BrowserSession {
       try { rmSync(this.state.profileDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* isolated profile cleanup is best effort */ }
     }
     try { unlinkSync(this.socketFile); } catch { /* already gone */ }
+    this.releaseLock();
   }
 }
 
@@ -596,7 +823,9 @@ async function serve(options) {
     // Keep the detached server alive while the Chrome session is leased.
     await new Promise(() => {});
   } catch (error) {
-    session.invalidate(`startup_failed:${error.message}`);
+    if (!(error instanceof SessionLockError)) {
+      session.invalidate(`startup_failed:${error.message}`);
+    }
     console.error(JSON.stringify({ ok: false, status: "failed", errorCode: "SESSION_START_FAILED", error: error.message }));
     process.exitCode = 1;
   }
@@ -616,7 +845,7 @@ async function start(options) {
     }
   }
   mkdirSync(dir, { recursive: true });
-  const child = spawn(process.execPath, [process.argv[1], "serve", "--session", options.session, "--root", options.root, "--lease-ms", String(options.leaseMs), ...(options.headed ? ["--headed"] : []), ...(options.keepProfile ? [] : ["--remove-profile"])], {
+  const child = spawn(process.execPath, [process.argv[1], "serve", "--session", options.session, "--root", options.root, "--lease-ms", String(options.leaseMs), ...(options.shared ? ["--shared"] : []), ...(options.authCheckUrl ? ["--auth-check-url", options.authCheckUrl] : []), ...(options.authCheckContains ? ["--auth-check-contains", options.authCheckContains] : []), ...(options.headed ? ["--headed"] : []), ...(options.keepProfile ? [] : ["--remove-profile"])], {
     stdio: ["ignore", "ignore", "ignore"],
     detached: true,
   });
@@ -632,8 +861,10 @@ async function stop(options) {
 }
 
 async function restart(options) {
+  let oldState = null;
   try {
     const state = readState(options);
+    oldState = state;
     if (isAlive(state.pid)) await request(options, { action: "close" });
   } catch {
     // A stale or already-closed session can be replaced directly.
@@ -645,19 +876,33 @@ async function restart(options) {
     } catch { break; }
     await sleep(50);
   }
-  await start(options);
+  await start({
+    ...options,
+    shared: options.shared || oldState?.profileMode === "shared",
+    headed: options.headed || Boolean(oldState?.headed),
+    authCheckUrl: options.authCheckUrl || oldState?.auth?.checkUrl || null,
+    authCheckContains: options.authCheckContains || oldState?.auth?.checkContains || null,
+  });
 }
 
 function printHelp() {
   console.log(`Usage:
-  browser_session_runner.mjs start --session NAME [--headed] [--lease-ms N]
-  browser_session_runner.mjs request --session NAME --action health
-  browser_session_runner.mjs request --session NAME --action navigate --url URL [--timeout-ms N]
-  browser_session_runner.mjs request --session NAME --action inspect [--timeout-ms N]
-  browser_session_runner.mjs request --session NAME --action cancel --operation-id ID
-  browser_session_runner.mjs stop --session NAME
-  browser_session_runner.mjs restart --session NAME [--headed] [--lease-ms N]
+  browser_session_runner.mjs start --session NAME [--shared] [--headed] [--lease-ms N]
+  browser_session_runner.mjs request --shared --session NAME --action health
+  browser_session_runner.mjs request --shared --session NAME --action navigate --url URL [--timeout-ms N]
+  browser_session_runner.mjs request --shared --session NAME --action inspect [--timeout-ms N]
+  browser_session_runner.mjs request --shared --session NAME --action auth-status
+  browser_session_runner.mjs request --shared --session NAME --action auth-required [--agent ID] [--reason TEXT]
+  browser_session_runner.mjs request --shared --session NAME --action auth-check --url URL [--contains TEXT]
+  browser_session_runner.mjs request --shared --session NAME --action auth-ready [--agent ID]
+  browser_session_runner.mjs request --shared --session NAME --action wait-auth [--timeout-ms N]
+  browser_session_runner.mjs request --shared --session NAME --action cancel --operation-id ID
+  browser_session_runner.mjs stop --shared --session NAME
+  browser_session_runner.mjs restart --shared --session NAME [--headed] [--lease-ms N]
 
+Add --shared to start/restart a persistent, dedicated profile (default root:
+~/.agent-browser-runtime/sessions). A headed shared session lets a user sign in
+manually once; other callers reuse the same session id and wait on auth state.
 The session is isolated, read-only, and managed through a local control socket.
 Timeout/cancel invalidates the Chrome session so no ghost tab is reused.
 `);
@@ -674,6 +919,9 @@ async function main() {
     const result = await request(options, {
       action: options.action || "health",
       url: options.url,
+      contains: options.contains,
+      agent: options.agent,
+      reason: options.reason,
       timeoutMs: options.timeoutMs,
       operationId: options.operationId,
     });

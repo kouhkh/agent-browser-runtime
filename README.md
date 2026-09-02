@@ -49,7 +49,8 @@ startup cost distinguishable instead of guessing from one wall-clock timeout.
 The session manager writes a `state.json` lease record and exposes a local
 newline-delimited JSON socket. Actions are:
 
-`health`, `navigate`, `inspect`, `cancel`, and `close`.
+`health`, `navigate`, `inspect`, `auth-status`, `auth-required`, `auth-check`,
+`auth-ready`, `wait-auth`, `cancel`, and `close`.
 
 Only one navigation/inspection may run at a time. A caller supplies an
 operation timeout (250 ms–120 s). If the deadline fires, or the caller issues
@@ -57,6 +58,63 @@ operation timeout (250 ms–120 s). If the deadline fires, or the caller issues
 The caller must explicitly `restart` or start a new session before retrying.
 Structured error codes include `STALE_SESSION`, `SESSION_BUSY`, `CANCELLED`,
 `OPERATION_TIMEOUT`, and `READ_ONLY_ACTION`.
+
+## Shared sign-in session
+
+If several coding-agent tasks need the same test account, start one explicitly
+shared, headed session. It owns a new profile under
+`~/.agent-browser-runtime/sessions` (never the user's normal Chrome profile):
+
+```bash
+node scripts/browser_session_runner.mjs start \
+  --shared --headed --session planora-test --lease-ms 86400000
+```
+
+Sign in manually in the Chrome window that opens. Verify the account with a
+read-only page marker, for example:
+
+```bash
+node scripts/browser_session_runner.mjs request \
+  --shared --session planora-test --action auth-check \
+  --url https://test.example/dashboard --contains "项目"
+```
+
+Every other task on the same machine reuses the same `--shared --session
+planora-test` (and therefore the same control socket and profile). It must not
+start another Chrome against that profile. A caller that sees a redirect to a
+login page or a missing marker records one shared re-login request:
+
+```bash
+node scripts/browser_session_runner.mjs request \
+  --shared --session planora-test --action auth-required \
+  --agent worker-2 --reason session_expired
+```
+
+Callers then use `wait-auth` (a state-only wait; it does not poll the page):
+
+```bash
+node scripts/browser_session_runner.mjs request \
+  --shared --session planora-test --action wait-auth --timeout-ms 120000
+```
+
+The user signs in again in the already-open headed window. The coordinator
+confirms it with `auth-check`, which changes the shared auth `epoch`; all
+callers observe the new epoch through `auth-status` and continue with the same
+profile. `auth-ready` is only a manual acknowledgement after an
+`auth-required` state; it is intentionally rejected otherwise. There is no
+automatic retry of the failed business operation, so an expired session cannot
+create a retry storm.
+
+The runner also keeps a per-session lock, so a second process cannot open the
+same profile concurrently. If the owner dies, the next explicit `start` may
+reclaim the lock after checking the recorded PID.
+
+This is explicit session sharing, not automatic sharing between Codex tasks or
+cookie/profile copying. The current runtime provides the shared local socket,
+single-flight browser access, auth state, and bounded waiting. It does not yet
+provide a network broker, per-agent identity/ACL, Playwright interactions, or a
+user notification channel. Those are required before exposing it to multiple
+machines or untrusted local users.
 
 ## Repository layout
 
@@ -115,8 +173,8 @@ directory; deleting it immediately can race Chrome's profile flush.
 Set `DIRECT_CDP_CHROME` for a non-default Chrome/Chromium installation. Keep
 the profile isolated; do not point the runner at a user's normal profile or
 copy cookies from the managed browser. A headed isolated profile can be used
-for a user to sign in manually, but that is a separate session and does not
-reuse Codex's in-app login.
+for a user to sign in manually. Use `--shared` when other tasks must reuse that
+dedicated profile; this still does not reuse Codex's in-app login.
 
 ## Measured comparison
 
@@ -152,6 +210,13 @@ Use this runtime by default for:
 - known-page navigation and visible-DOM extraction;
 - repeated coding-agent tests where a stale tab must fail fast and be rebuilt;
 - timing comparisons that need page/network bytes separated from bridge cost.
+
+Use one shared headed session for:
+
+- a deliberately selected test account whose login must be reused by several
+  local coding-agent tasks;
+- one-time manual re-login coordinated through `auth-required`/`wait-auth`/
+  `auth-check`.
 
 Keep the managed Browser for:
 
