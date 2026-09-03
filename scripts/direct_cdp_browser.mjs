@@ -143,18 +143,21 @@ async function connectCdp(webSocketUrl, timeoutMs) {
 
 function visibleDomExpression() {
   return `(() => {
-    const visible = (node) => {
-      if (!(node instanceof Element)) return false;
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+    const rawText = document.body?.innerText || '';
+    const text = rawText
+      .replace(/\\r\\n?/g, '\\n')
+      .replace(/[ \\t]+\\n/g, '\\n')
+      .replace(/\\n{3,}/g, '\\n\\n')
+      .trim();
+    const limit = 8000;
+    return {
+      readyState: document.readyState,
+      title: document.title,
+      url: location.href,
+      visibleText: text.slice(0, limit),
+      visibleTextTotalChars: text.length,
+      visibleTextTruncated: text.length > limit,
     };
-    const text = [...document.querySelectorAll('body *')]
-      .filter(visible)
-      .map((node) => (node.innerText || '').trim())
-      .filter(Boolean)
-      .join('\\n');
-    return { readyState: document.readyState, title: document.title, url: location.href, visibleText: text.slice(0, 20000) };
   })()`;
 }
 

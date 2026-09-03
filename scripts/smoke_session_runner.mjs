@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ import process from "node:process";
 const runner = join(fileURLToPath(new URL(".", import.meta.url)), "browser_session_runner.mjs");
 const root = mkdtempSync(join(tmpdir(), "agent-browser-runtime-smoke-"));
 const session = "smoke";
-const env = { ...process.env, DIRECT_CDP_SESSION_ROOT: root };
+const env = { ...process.env, DIRECT_CDP_SESSION_ROOT: root, AGENT_BROWSER_SMOKE_VALUE: "bootstrap value" };
 
 function run(args) {
   const output = execFileSync(process.execPath, [runner, ...args], { env, encoding: "utf8" });
@@ -52,7 +52,7 @@ async function removeTreeEventually(path) {
 }
 
 async function main() {
-  const privateUrl = "data:text/html,<title>private</title><main>signed-in fixture</main>";
+  const privateUrl = `data:text/html,${encodeURIComponent("<title>private</title><main>signed-in fixture<input id='name'><input id='file' type='file'><button id='apply' onclick=\"document.querySelector('output').textContent=document.querySelector('#name').value\">Apply</button><output></output></main>")}`;
   try {
     const started = run(["start", "--shared", "--session", session, "--lease-ms", "60000"]);
     if (started.status !== "ready" || started.state?.profileMode !== "shared") {
@@ -74,6 +74,57 @@ async function main() {
     if (!checked.ok || checked.status !== "authenticated" || checked.auth?.epoch !== 1) {
       throw new Error(`auth-check failed: ${JSON.stringify(checked)}`);
     }
+    if ((checked.result?.visibleText?.match(/signed-in fixture/g) || []).length !== 1) {
+      throw new Error(`visible text contains duplicated ancestor text: ${JSON.stringify(checked.result)}`);
+    }
+
+    const unauthorizedClick = run([
+      "request", "--session", session, "--action", "click", "--selector", "#apply",
+    ]);
+    if (unauthorizedClick.ok || unauthorizedClick.errorCode !== "AUTHORIZATION_REQUIRED") {
+      throw new Error(`click without authorization was accepted: ${JSON.stringify(unauthorizedClick)}`);
+    }
+
+    const filled = run([
+      "request", "--session", session, "--action", "fill", "--selector", "#name",
+      "--value", "audited value", "--label", "Fill fixture", "--authorization", "local smoke fixture",
+    ]);
+    if (!filled.ok || filled.input?.value || filled.evidence?.screenshots?.length !== 2 || !filled.evidence.screenshots[0]?.found) {
+      throw new Error(`audited fill failed: ${JSON.stringify(filled)}`);
+    }
+    const clicked = run([
+      "request", "--session", session, "--action", "click", "--selector", "#apply",
+      "--label", "Apply fixture", "--authorization", "local smoke fixture",
+    ]);
+    if (!clicked.ok || !clicked.result?.visibleText?.includes("audited value") || clicked.evidence?.screenshots?.length !== 2 || !clicked.evidence.screenshots[0]?.found) {
+      throw new Error(`audited click failed: ${JSON.stringify(clicked)}`);
+    }
+    const waitedFor = run([
+      "request", "--session", session, "--action", "wait-for", "--selector", "output",
+      "--contains", "audited value", "--label", "Wait for fixture output", "--timeout-ms", "5000",
+    ]);
+    if (!waitedFor.ok || waitedFor.evidence?.screenshots?.length !== 1 || !waitedFor.evidence.screenshots[0]?.found) {
+      throw new Error(`audited wait-for failed: ${JSON.stringify(waitedFor)}`);
+    }
+    const uploaded = run([
+      "request", "--session", session, "--action", "upload", "--selector", "#file",
+      "--file", runner, "--label", "Upload fixture file", "--authorization", "local smoke fixture",
+    ]);
+    if (!uploaded.ok || uploaded.interaction?.files?.[0]?.name !== "browser_session_runner.mjs" || uploaded.evidence?.screenshots?.length !== 2) {
+      throw new Error(`audited upload failed: ${JSON.stringify(uploaded)}`);
+    }
+    const tracePath = join(root, session, "evidence", "trace.ndjson");
+    const traceText = readFileSync(tracePath, "utf8");
+    const traces = traceText.trim().split("\n").map((line) => JSON.parse(line));
+    if (traces.length < 7 || traces.some((trace) => trace.action === "fill" && trace.input?.redacted !== true)) {
+      throw new Error(`evidence trace is missing or unsafe: ${JSON.stringify(traces)}`);
+    }
+    if (traceText.includes("audited value")) throw new Error("fill value leaked into evidence trace");
+    for (const trace of traces) {
+      for (const screenshot of trace.screenshots || []) {
+        if (!existsSync(screenshot.path)) throw new Error(`evidence screenshot is missing: ${screenshot.path}`);
+      }
+    }
 
     const premature = run([
       "request", "--session", session, "--action", "auth-ready", "--agent", "worker-a",
@@ -88,6 +139,23 @@ async function main() {
     ]);
     if (required.errorCode !== "AUTH_REQUIRED" || required.auth?.status !== "required") {
       throw new Error(`auth-required failed: ${JSON.stringify(required)}`);
+    }
+
+    const blockedBootstrap = run([
+      "request", "--session", session, "--action", "fill", "--selector", "#name",
+      "--value-env", "AGENT_BROWSER_SMOKE_VALUE", "--label", "Blocked login bootstrap",
+      "--authorization", "local smoke fixture",
+    ]);
+    if (blockedBootstrap.status !== "auth_required" || blockedBootstrap.auth?.status !== "required") {
+      throw new Error(`auth-required did not block ordinary fill: ${JSON.stringify(blockedBootstrap)}`);
+    }
+    const bootstrapped = run([
+      "request", "--session", session, "--action", "fill", "--selector", "#name",
+      "--value-env", "AGENT_BROWSER_SMOKE_VALUE", "--label", "Automated test-login bootstrap",
+      "--authorization", "local smoke fixture", "--auth-bootstrap",
+    ]);
+    if (!bootstrapped.ok || bootstrapped.input?.value || bootstrapped.interaction?.valueLength !== 15) {
+      throw new Error(`authorized auth bootstrap failed: ${JSON.stringify(bootstrapped)}`);
     }
 
     const waiting = runAsync([

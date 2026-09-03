@@ -1,7 +1,7 @@
 {
   "name": "agent-browser-runtime",
-  "version": "0.2.0",
-  "description": "A dependency-free, read-only Chrome/CDP runtime for coding-agent browser diagnostics.",
+  "version": "0.3.0",
+  "description": "A dependency-free, auditable Chrome/CDP runtime for coding-agent browser diagnostics and authorized UI checks.",
   "type": "module",
   "bin": {
     "agent-browser-session": "scripts/browser_session_runner.mjs",

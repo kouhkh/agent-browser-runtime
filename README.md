@@ -12,10 +12,11 @@ The project currently contains two complementary executables:
   heartbeats, single-flight operations, cancellation, and stale-session
   invalidation.
 
-The runtime is intentionally read-only. It does not submit forms, upload
-files, mutate application data, or reuse a user's existing browser profile.
-Use a managed browser only when an existing signed-in session or an explicit
-human confirmation is required.
+Read-only navigation remains the default. The session runner also supports a
+small authorized interaction surface (`click`, `fill`, and `upload`). Those operations
+require an explicit authorization scope and cannot run without mandatory
+structured traces and annotated before/after screenshots. The runtime never
+reuses a user's normal Chrome profile.
 
 ## Quick start
 
@@ -33,6 +34,20 @@ node scripts/browser_session_runner.mjs request --session demo --action inspect
 node scripts/browser_session_runner.mjs stop --session demo
 ```
 
+Every browser operation writes evidence below the session directory. For an
+authorized interaction, identify the control with a CSS selector:
+
+```bash
+node scripts/browser_session_runner.mjs request --session demo --action click \
+  --selector '[data-testid="open-project"]' \
+  --label "Open acceptance project" \
+  --authorization "User-approved test-environment acceptance"
+```
+
+The before/after PNGs contain a red target box, step label, and mouse pointer.
+See [`docs/evidence-contract.md`](docs/evidence-contract.md) for the trace
+schema and the non-bypass rule.
+
 For a single measurement:
 
 ```bash
@@ -49,15 +64,24 @@ startup cost distinguishable instead of guessing from one wall-clock timeout.
 The session manager writes a `state.json` lease record and exposes a local
 newline-delimited JSON socket. Actions are:
 
-`health`, `navigate`, `inspect`, `auth-status`, `auth-required`, `auth-check`,
-`auth-ready`, `wait-auth`, `cancel`, and `close`.
+`health`, `navigate`, `inspect`, `screenshot`, `wait-for`, `click`, `fill`, `upload`, `auth-status`,
+`auth-required`, `auth-check`, `auth-ready`, `wait-auth`, `cancel`, and `close`.
 
-Only one navigation/inspection may run at a time. A caller supplies an
+Only one browser operation may run at a time. A caller supplies an
 operation timeout (250 ms–120 s). If the deadline fires, or the caller issues
 `cancel`, the session becomes `stale` and its Chrome process is terminated.
 The caller must explicitly `restart` or start a new session before retrying.
 Structured error codes include `STALE_SESSION`, `SESSION_BUSY`, `CANCELLED`,
-`OPERATION_TIMEOUT`, and `READ_ONLY_ACTION`.
+`OPERATION_TIMEOUT`, `AUTHORIZATION_REQUIRED`, and `UNSUPPORTED_ACTION`.
+
+`navigate`, `inspect`, `screenshot`, `wait-for`, and `auth-check` always save an
+annotated post-operation screenshot. `click`, `fill`, and `upload` always save
+annotated before and after screenshots. Every browser action appends timing,
+network, page, locator, and result metadata to `trace.ndjson`; `fill` input
+values are redacted, and uploads record file names/sizes rather than contents.
+Rendered page text is de-duplicated and capped at 8,000 characters; responses expose the
+uncapped character count and a truncation flag so callers can request narrower evidence
+instead of flooding agent context.
 
 ## Shared sign-in session
 
@@ -105,16 +129,25 @@ profile. `auth-ready` is only a manual acknowledgement after an
 automatic retry of the failed business operation, so an expired session cannot
 create a retry storm.
 
+For a deliberately non-secret development/test account, the application test
+harness may automate only the login-page bootstrap. It supplies
+`--auth-bootstrap` on the login page's `fill`/`click` requests and reads values
+through `--value-env`, so credentials do not appear in the process argument
+list or evidence trace. The generic runtime does not store account names,
+passwords, or application-specific selectors. A final `auth-check` must still
+verify the authenticated landing page before any business action runs.
+
 The runner also keeps a per-session lock, so a second process cannot open the
 same profile concurrently. If the owner dies, the next explicit `start` may
 reclaim the lock after checking the recorded PID.
 
 This is explicit session sharing, not automatic sharing between Codex tasks or
 cookie/profile copying. The current runtime provides the shared local socket,
-single-flight browser access, auth state, and bounded waiting. It does not yet
-provide a network broker, per-agent identity/ACL, Playwright interactions, or a
-user notification channel. Those are required before exposing it to multiple
-machines or untrusted local users.
+single-flight browser access, auth state, bounded waiting, mandatory evidence,
+and CSS-selector click/fill/upload operations. It does not yet provide a network
+broker, per-agent identity/ACL, keyboard/chord actions, robust
+role/text locators, or a user notification channel. Those are required before
+exposing it to multiple machines or untrusted local users.
 
 ## Repository layout
 
@@ -124,6 +157,7 @@ scripts/direct_cdp_browser.mjs      one-shot CDP probe and timing output
 scripts/smoke_session_runner.mjs    local end-to-end smoke test
 LICENSE                             Apache License 2.0
 docs/architecture.md                design and migration boundary
+docs/evidence-contract.md           mandatory trace and screenshot contract
 docs/skills/direct-cdp-browser.md   Codex skill adapter instructions
 ```
 
@@ -144,9 +178,10 @@ adapter design, including the path toward Playwright/CDP-backed test tooling.
 ## Replacing the managed browser path
 
 This runtime can replace the Codex managed-browser execution path for a useful
-subset of coding-agent work: known URLs, health checks, repeatable read-only
-navigation, and DOM assertions. It is an execution-layer replacement, not a
-replacement for an existing signed-in browser session or for human UI review.
+subset of coding-agent work: known URLs, health checks, repeatable navigation,
+DOM assertions, and explicitly authorized CSS-selector interactions. It is an
+execution-layer replacement, not a replacement for an existing in-app browser
+session or for human judgment.
 
 The repeatable workflow is:
 
@@ -222,16 +257,14 @@ Keep the managed Browser for:
 
 - an existing Codex/in-app login session (this runtime deliberately cannot
   read or copy it);
-- user-visible screenshots, manual sign-in, confirmation, or other human
-  handoff steps;
-- interactions not yet represented by the read-only `navigate`/`inspect`
-  contract.
+- manual sign-in or confirmation that must occur inside the managed browser;
+- keyboard/chord actions, role/text locators, multi-tab workflows,
+  or other interactions not yet represented by the session contract.
 
 The current implementation therefore replaces the *standalone execution path*,
-not every browser capability. A Playwright locator/interaction adapter and a
-separate control plane can be added later without changing the session
-contract. Neither would remove the need for explicit deadlines, cancellation,
-leases, and stale-session invalidation.
+not every browser capability. A richer Playwright-compatible adapter can be
+added later without changing the evidence, authorization, deadline,
+cancellation, lease, and stale-session guarantees.
 
 ## License
 

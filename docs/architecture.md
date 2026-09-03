@@ -13,17 +13,20 @@ Browser host.
 
 1. **Session manager** owns one isolated Chrome process, one page target, a
    lease, heartbeat checks, and a local control socket.
-2. **Operation boundary** serializes navigation/inspection, carries an
+2. **Operation boundary** serializes browser operations, carries an
    `AbortSignal`, and enforces a caller-supplied deadline.
 3. **Invalidation path** marks the session stale and terminates Chrome on tab
    loss, CDP disconnect, timeout, cancellation, lease expiry, or process exit.
 4. **One-shot probe** measures a fresh process separately from warm-session
    operations, including page/network counters.
-5. **Shared-auth coordinator** (only for an explicitly shared session) records
+5. **Evidence recorder** writes a trace and annotated screenshot for every
+   browser operation. Click/fill/upload are two-phase records with before and after
+   captures; failure to persist evidence fails the operation.
+6. **Shared-auth coordinator** (only for an explicitly shared session) records
    auth state and epoch, turns an observed login redirect into one
    `auth-required` condition, and lets other callers wait on state rather than
    repeatedly probing the browser.
-6. **Adapters** (the Codex skill today; Playwright or an HTTP/MCP adapter later)
+7. **Adapters** (the Codex skill today; Playwright or an HTTP/MCP adapter later)
    translate an agent request into this stable session contract.
 
 ## Request flow
@@ -49,13 +52,21 @@ state file and does not issue repeated page requests. A successful
 the state to `ready` and increments `auth.epoch`. The business operation that
 encountered expiry is not retried implicitly.
 
+The session socket is also the evidence boundary. Callers use its declarative
+actions instead of attaching an uncontrolled client directly to the CDP port.
+Browser actions are single-flight and always append `trace.ndjson`; visual
+actions save annotated screenshots. `click`, `fill`, and `upload` additionally require a
+non-empty authorization scope. Evidence capture is therefore a runtime
+invariant rather than a prompt convention.
+
 ## Why CDP first
 
 CDP is the smallest dependency-free execution layer available in this
-repository. Playwright remains a compatible higher-level adapter when robust
-locators, browser contexts, or richer assertions are needed. Neither choice
-removes the need for leases, cancellation, and stale-session invalidation;
-those are lifecycle guarantees above the protocol.
+repository. The current interaction surface intentionally supports CSS-based
+click/fill/upload only. A future Playwright-compatible adapter may add robust
+locators, browser contexts, uploads, and richer assertions, but it must run
+behind the same session, authorization, evidence, deadline, and cancellation
+contract rather than attaching to the shared port independently.
 
 ## Security and environment rules
 
@@ -71,14 +82,18 @@ those are lifecycle guarantees above the protocol.
   recorded owner PID is no longer alive.
 - Remote targets must be identity-checked and explicitly authorized by the
   caller. Test, customer, and intranet environments are never interchangeable.
-- The current actions are read-only. Mutation-capable actions require a
-  separate reviewed adapter and an explicit authorization boundary.
+- Navigation, inspection, screenshots, and waits are read-only. `click`,
+  `fill`, and `upload` are allowed only with an explicit authorization scope
+  and mandatory before/after evidence.
+- Fill values are never persisted in traces; only their length is recorded.
 
 ## Next increments
 
-- Add a Playwright adapter that implements the same session contract.
-- Persist structured traces (operation id, timings, bytes, stale reason) in an
-  evidence store without retaining page secrets.
+- Add a Playwright-compatible adapter behind the same session and evidence
+  contract for role/text locators, keyboard actions, and multi-tab
+  scenarios.
+- Add retention and configurable screenshot-redaction policies for the local
+  evidence store.
 - Add a hardened control-plane API for `createSession`, `health`, `navigate`,
   `inspect`, `cancel`, `close`, `getTrace`, and explicit auth handoff. It needs
   per-agent identity/ACL, owner leases, a user notification channel, and

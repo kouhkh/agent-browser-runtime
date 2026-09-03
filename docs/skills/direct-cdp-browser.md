@@ -1,101 +1,105 @@
 ---
 name: direct-cdp-browser
-description: Use an isolated local Chrome over direct CDP for fast, read-only page navigation and DOM checks when a managed browser bridge is slow or timing out.
+description: Use an isolated local Chrome over direct CDP for fast, auditable page checks when a managed browser bridge is slow or timing out; authorized interactions are recorded automatically.
 ---
 
 # Direct CDP browser
 
-This adapter starts an isolated Chrome profile and talks to the Chrome DevTools
-Protocol directly. It is intended for coding-agent diagnostics and repeatable
-web checks. An explicitly shared headed session can also hold a deliberately
-selected test-account login; it still never reads or copies a managed-browser
-profile.
+Use the repository session runner as the browser control plane. It owns an
+isolated Chrome profile, explicit deadlines, stale-session invalidation,
+shared-login coordination, and mandatory evidence capture.
 
-## Scope and safety
+Repository root: `/Users/ltc/CodexProject/agent-browser-runtime`
 
-- Use a temporary, isolated Chrome profile. Never read or copy cookies,
-  storage, passwords, or an existing profile.
-- For login reuse, use `--shared` to create a new persistent profile owned by
-  this runtime. Never point it at a normal Chrome profile.
-- Keep operations read-only. The included helpers only navigate and inspect
-  visible DOM state.
-- Verify the exact target environment and host identity before checking a
-  remote system. Do not use this adapter for customer or intranet hosts
-  without explicit authorization.
-- Do not submit forms, upload files, or follow destructive links.
+## Required boundaries
 
-## One-shot check
+- Verify the exact remote environment and host identity before the first
+  remote check. Never transfer facts between test, customer, and intranet
+  environments.
+- Use a temporary isolated profile by default. Use `--shared` only for a
+  deliberately selected test account. Never read or copy a normal Chrome or
+  managed-browser profile.
+- Navigation, inspection, screenshots, and waits are read-only. Use `click`,
+  `fill`, or `upload` only when the
+  user authorized that mutation on the verified target; pass a concise
+  authorization scope to every such command.
+- Use the session runner actions. Do not attach Playwright or another client
+  directly to the shared CDP port and then claim the result is audited.
+- Never retry a timed-out business operation automatically. A timeout makes
+  the session stale; restart explicitly only when a retry is justified.
 
-```bash
-node scripts/direct_cdp_browser.mjs \
-  --url https://example.com --runs 3 --timeout-ms 15000
-```
-
-Each run emits one JSON record containing navigation, DOM-evaluation, title,
-visible-character, response-count, encoded-byte, and Chrome-process timings.
-There is no fixed 30-second outer bridge deadline.
-
-## Reusable session
-
-Use the session manager for multiple operations. It owns one isolated Chrome
-process and a local newline-delimited JSON control socket.
+## Session workflow
 
 ```bash
-node scripts/browser_session_runner.mjs start \
-  --session diagnosis --lease-ms 900000
-node scripts/browser_session_runner.mjs request \
-  --session diagnosis --action health
-node scripts/browser_session_runner.mjs request \
-  --session diagnosis --action navigate \
-  --url https://example.com --timeout-ms 5000
-node scripts/browser_session_runner.mjs request \
-  --session diagnosis --action inspect --timeout-ms 5000
-node scripts/browser_session_runner.mjs stop --session diagnosis
+RUNNER=/Users/ltc/CodexProject/agent-browser-runtime/scripts/browser_session_runner.mjs
+
+node "$RUNNER" start --shared --session planora-test \
+  --lease-ms 86400000 \
+  --evidence-dir /absolute/path/to/evidence
+
+node "$RUNNER" request --shared --session planora-test \
+  --action auth-check --url http://test.example/dashboard \
+  --contains "项目" --label "Verify authenticated project list" \
+  --timeout-ms 15000
 ```
 
-Set `DIRECT_CDP_CHROME` when Chrome is not at the macOS default path. Set
-`DIRECT_CDP_SESSION_ROOT` to choose where session state and the isolated
-profile are stored. Pass `--headed` only when a user must sign in manually to
-this dedicated profile. For a profile shared by local agent tasks:
+Reuse the same session id from other local tasks. If authentication expires,
+record `auth-required` once and use `wait-auth`; do not poll the login page or
+repeat the failed business action.
+
+## Audited operations
 
 ```bash
-node scripts/browser_session_runner.mjs start \
-  --shared --headed --session planora-test --lease-ms 86400000
-# User signs in in the opened window, then verify a non-login page marker:
-node scripts/browser_session_runner.mjs request \
-  --shared --session planora-test --action auth-check \
-  --url https://test.example/dashboard --contains "项目"
+# Read-only navigation and evidence screenshot
+node "$RUNNER" request --shared --session planora-test \
+  --action navigate --url http://test.example/projects/123 \
+  --label "Open acceptance project" --timeout-ms 15000
+
+# Highlight an assertion target without business mutation
+node "$RUNNER" request --shared --session planora-test \
+  --action screenshot --selector '[data-testid="job-progress"]' \
+  --label "Observe real job progress" --timeout-ms 8000
+
+# Wait for slow application state instead of guessing a fixed delay
+node "$RUNNER" request --shared --session planora-test \
+  --action wait-for --selector '[data-testid="job-progress"]' \
+  --contains "执行中" --label "Wait for real progress" --timeout-ms 15000
+
+# Authorized file upload; repeat --file for multiple files
+node "$RUNNER" request --shared --session planora-test \
+  --action upload --selector 'input[type="file"]' \
+  --file /absolute/path/sample.docx --label "Upload acceptance sample" \
+  --authorization "User-approved public test acceptance" --timeout-ms 15000
+
+# Authorized interaction; before/after evidence is automatic
+node "$RUNNER" request --shared --session planora-test \
+  --action click --selector '[data-testid="submit"]' \
+  --label "Submit sixth rewrite" \
+  --authorization "User-approved public test acceptance" \
+  --timeout-ms 8000
 ```
 
-If any caller sees expiry, it records one condition and waits for the user to
-complete the sign-in; it must not retry the business request in a loop:
+`navigate`, `inspect`, `screenshot`, `wait-for`, and `auth-check` save a
+post-operation PNG. `click`, `fill`, and `upload` save both before and after
+PNGs. The target is outlined
+in red and marked with a mouse pointer. Every operation appends a structured
+record to `trace.ndjson` with URL, locator, deadline, elapsed time, network
+responses/bytes, screenshots, and terminal result. Fill values are redacted;
+only their length is recorded. Uploads retain file names and sizes, not file
+contents.
 
-```bash
-node scripts/browser_session_runner.mjs request \
-  --shared --session planora-test --action auth-required \
-  --agent worker-2 --reason session_expired
-node scripts/browser_session_runner.mjs request \
-  --shared --session planora-test --action wait-auth --timeout-ms 120000
-```
+Read [the evidence contract](/Users/ltc/CodexProject/agent-browser-runtime/docs/evidence-contract.md)
+before changing the interaction adapter or evidence format.
 
-The coordinator confirms the new login with `auth-check`. The state file's
-`auth.epoch` changes only when a required/unknown session becomes ready, so
-other tasks can detect one coordinated re-login without sharing credentials.
+## Reporting results
 
-## Lifecycle and timeout rules
+A successful browser command proves the action completed, not that the product
+behavior is correct. Record the business assertion beside the operation id and
+screenshot paths. If the required operation cannot be expressed through the
+runtime, report the missing capability and do not silently improvise an
+unrecorded fallback.
 
-- A session has `starting`, `ready`, `busy`, `stale`, and `closed` states.
-- A lease, heartbeat, target-id check, and single-flight operation prevent
-  stale tabs from being reused.
-- Every operation has an explicit bounded timeout. A timeout or cancellation
-  invalidates and terminates the isolated Chrome process; callers must create a
-  fresh session for a retry.
-- The runner never retries a failed operation automatically.
-- Supported actions are deliberately limited to `health`, `navigate`,
-  `inspect`, `auth-status`, `auth-required`, `auth-check`, `auth-ready`,
-  `wait-auth`, `cancel`, and `close`.
-
-If direct CDP is fast while a managed browser is slow, the evidence points to
-the managed bridge/service path rather than page/network work. If direct CDP is
-also slow, inspect the emitted page/network timing fields before attributing
-the delay to a bridge.
+For a one-shot timing-only measurement that needs no authenticated state or
+interaction, `scripts/direct_cdp_browser.mjs` remains available. It reports
+Chrome startup, navigation, DOM, response, and byte timings and has no fixed
+30-second outer bridge wait.
