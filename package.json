@@ -1,6 +1,8 @@
 {
   "name": "agent-browser-runtime",
   "version": "0.3.0",
+  "private": true,
+  "deprecated": "Migrated to agent-eval-platform/packages/browser-runner; retained as history only.",
   "description": "A dependency-free, auditable Chrome/CDP runtime for coding-agent browser diagnostics and authorized UI checks.",
   "type": "module",
   "bin": {

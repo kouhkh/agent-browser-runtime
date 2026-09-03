@@ -1,6 +1,11 @@
 # agent-browser-runtime
 
-`agent-browser-runtime` is a small, dependency-free browser execution layer
+> **Frozen migration source.** Active development moved to
+> `agent-eval-platform/packages/browser-runner`. Commit `8917906` is the
+> migration baseline; do not add a second session/evidence/policy
+> implementation here. See [`MIGRATED.md`](MIGRATED.md).
+
+`agent-browser-runtime` was a small, dependency-free browser execution layer
 for coding-agent diagnostics. It launches an isolated Chrome profile and uses
 the Chrome DevTools Protocol (CDP) directly, so a slow or wedged managed
 browser bridge cannot hold an operation until an outer 30,000 ms deadline.

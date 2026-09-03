@@ -5,6 +5,10 @@ description: Use an isolated local Chrome over direct CDP for fast, auditable pa
 
 # Direct CDP browser
 
+> Historical instructions only. The installed Codex skill and active runtime
+> now point to `agent-eval-platform/packages/browser-runner`. Do not use this
+> document to start new browser work.
+
 Use the repository session runner as the browser control plane. It owns an
 isolated Chrome profile, explicit deadlines, stale-session invalidation,
 shared-login coordination, and mandatory evidence capture.
