@@ -184,6 +184,17 @@ async function main() {
     if (!persisted.ok || persisted.auth?.epoch !== 2) {
       throw new Error(`profile/auth metadata did not persist: ${JSON.stringify(persisted)}`);
     }
+    const timedOut = run([
+      "request", "--session", session, "--action", "wait-for",
+      "--selector", "#never-matches", "--timeout-ms", "250",
+    ]);
+    if (timedOut.ok || timedOut.status !== "timeout" || timedOut.stale !== true) {
+      throw new Error(`timeout did not invalidate the session: ${JSON.stringify(timedOut)}`);
+    }
+    const recovered = run(["restart", "--shared", "--session", session, "--lease-ms", "60000"]);
+    if (recovered.status !== "ready" || recovered.state?.auth?.epoch !== 2) {
+      throw new Error(`restart did not reclaim a stale session: ${JSON.stringify(recovered)}`);
+    }
     const finalStopped = run(["stop", "--session", session]);
     if (!finalStopped.ok || finalStopped.status !== "closed") throw new Error(`final stop failed: ${JSON.stringify(finalStopped)}`);
     console.log(JSON.stringify({ ok: true, status: "smoke_passed", session, sharedProfile: true, authEpoch: persisted.auth.epoch }));

@@ -60,6 +60,12 @@ cannot express an operation through this surface must report the missing
 runtime capability; it must not silently connect another client directly to
 the shared CDP port and then claim an audited result.
 
+Ordinary button/link clicks use the selected element's native DOM `click()`
+after visibility/disabled checks and evidence capture. Coordinate-dependent
+gestures such as drag, hover menus, or canvas interaction are intentionally a
+separate future surface; they must not be approximated through an unbounded
+low-level mouse-event sequence.
+
 ## Example
 
 ```bash

@@ -70,6 +70,7 @@ newline-delimited JSON socket. Actions are:
 Only one browser operation may run at a time. A caller supplies an
 operation timeout (250 ms–120 s). If the deadline fires, or the caller issues
 `cancel`, the session becomes `stale` and its Chrome process is terminated.
+The stale control socket and profile lock are released as part of invalidation.
 The caller must explicitly `restart` or start a new session before retrying.
 Structured error codes include `STALE_SESSION`, `SESSION_BUSY`, `CANCELLED`,
 `OPERATION_TIMEOUT`, `AUTHORIZATION_REQUIRED`, and `UNSUPPORTED_ACTION`.
@@ -82,6 +83,8 @@ values are redacted, and uploads record file names/sizes rather than contents.
 Rendered page text is de-duplicated and capped at 8,000 characters; responses expose the
 uncapped character count and a truncation flag so callers can request narrower evidence
 instead of flooding agent context.
+Normal controls are activated with a bounded native DOM click after selector and disabled
+checks. Coordinate gestures are not silently emulated by the ordinary click action.
 
 ## Shared sign-in session
 

@@ -1054,10 +1054,27 @@ class BrowserSession {
   }
 
   async click(selector, timeoutMs, signal) {
-    const target = await this.targetCenter(selector, timeoutMs, signal);
-    await this.cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: target.x, y: target.y }, timeoutMs, signal);
-    await this.cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: target.x, y: target.y, button: "left", clickCount: 1 }, timeoutMs, signal);
-    await this.cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: target.x, y: target.y, button: "left", clickCount: 1 }, timeoutMs, signal);
+    if (typeof selector !== "string" || !selector.trim()) throw new Error("interaction requires --selector");
+    const target = await this.evaluate(`(() => {
+      const target = document.querySelector(${JSON.stringify(selector.trim())});
+      if (!target) return null;
+      target.scrollIntoView({ block: 'center', inline: 'center' });
+      const rect = target.getBoundingClientRect();
+      const details = {
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        disabled: Boolean(target.disabled),
+        tag: target.tagName,
+        type: target.getAttribute('type'),
+        mode: 'dom_click',
+      };
+      if (details.disabled) return details;
+      if (typeof target.focus === 'function') target.focus({ preventScroll: true });
+      target.click();
+      return details;
+    })()`, timeoutMs, signal);
+    if (!target) throw new Error(`No element matches selector: ${selector}`);
+    if (target.disabled) throw new Error(`Target is disabled: ${selector}`);
     return target;
   }
 
@@ -1155,12 +1172,22 @@ class BrowserSession {
   invalidate(reason) {
     if (this.invalidated) return;
     this.invalidated = true;
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
+    }
     this.state.status = "stale";
     this.state.state = "stale";
     this.state.staleReason = reason;
     this.save({ status: "stale", state: "stale", staleReason: reason });
     this.cdp?.close(new Error(`Session invalidated: ${reason}`));
     this.cdp = null;
+    // Stop accepting work and release ownership immediately. The current
+    // control connection still receives its terminal response; server.close()
+    // completes after respond() ends that socket.
+    if (this.server) this.server.close(() => {});
+    try { unlinkSync(this.socketFile); } catch { /* already gone */ }
+    this.releaseLock();
     this.killChrome();
   }
 
@@ -1218,9 +1245,11 @@ async function serve(options) {
 async function start(options) {
   mkdirSync(options.root, { recursive: true });
   const dir = sessionDir(options);
+  let previousInstanceCreatedAt = null;
   if (existsSync(statePath(options))) {
     try {
       const old = readState(options);
+      previousInstanceCreatedAt = old.createdAt || null;
       if (["starting", "ready", "busy"].includes(old.status) && isAlive(old.pid)) {
         throw new Error(`Session already exists: ${options.session} (${old.status})`);
       }
@@ -1234,7 +1263,10 @@ async function start(options) {
     detached: true,
   });
   child.unref();
-  const state = await waitForState(options, (item) => item.status === "ready" || item.status === "stale", 15000);
+  const state = await waitForState(options, (item) => {
+    const isNewInstance = !previousInstanceCreatedAt || item.createdAt !== previousInstanceCreatedAt;
+    return isNewInstance && (item.status === "ready" || item.status === "stale");
+  }, 15000);
   if (state.status !== "ready") throw new Error(`Session failed to start: ${state.staleReason || "unknown"}`);
   console.log(JSON.stringify({ ok: true, status: "ready", session: options.session, state }));
 }
@@ -1249,14 +1281,20 @@ async function restart(options) {
   try {
     const state = readState(options);
     oldState = state;
-    if (isAlive(state.pid)) await request(options, { action: "close" });
+    // A stale session may already have killed Chrome while its control owner
+    // is still completing the timed-out response. Close by control socket,
+    // rather than keying only on the Chrome PID.
+    if (existsSync(state.socketPath || socketPath(options))) {
+      await request(options, { action: "close" }).catch(() => undefined);
+    }
   } catch {
     // A stale or already-closed session can be replaced directly.
   }
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
     try {
-      if (!isAlive(readState(options).pid)) break;
+      const state = readState(options);
+      if (!isAlive(state.pid) && !existsSync(state.socketPath || socketPath(options)) && !existsSync(state.lockPath || lockPath(options))) break;
     } catch { break; }
     await sleep(50);
   }
