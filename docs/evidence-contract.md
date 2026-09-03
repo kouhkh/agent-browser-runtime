@@ -66,6 +66,11 @@ gestures such as drag, hover menus, or canvas interaction are intentionally a
 separate future surface; they must not be approximated through an unbounded
 low-level mouse-event sequence.
 
+If a click opens `alert`, `confirm`, `prompt`, or `beforeunload`, the runtime
+records the dialog type/message and the declared handling. An undeclared dialog
+is dismissed and the action returns `DIALOG_REQUIRED`; accepting a dialog must
+be explicit through `--dialog accept` and the existing authorization scope.
+
 ## Example
 
 ```bash

@@ -52,7 +52,7 @@ async function removeTreeEventually(path) {
 }
 
 async function main() {
-  const privateUrl = `data:text/html,${encodeURIComponent("<title>private</title><main>signed-in fixture<input id='name'><input id='file' type='file'><button id='apply' onclick=\"document.querySelector('output').textContent=document.querySelector('#name').value\">Apply</button><output></output></main>")}`;
+  const privateUrl = `data:text/html,${encodeURIComponent("<title>private</title><main>signed-in fixture<input id='name'><input id='file' type='file'><button id='apply' onclick=\"document.querySelector('output').textContent=document.querySelector('#name').value\">Apply</button><button id='confirm' onclick=\"if(confirm('Proceed with fixture?')) document.querySelector('#dialog-output').textContent='confirmed'\">Confirm</button><output></output><span id='dialog-output'></span></main>")}`;
   try {
     const started = run(["start", "--shared", "--session", session, "--lease-ms", "60000"]);
     if (started.status !== "ready" || started.state?.profileMode !== "shared") {
@@ -98,6 +98,20 @@ async function main() {
     ]);
     if (!clicked.ok || !clicked.result?.visibleText?.includes("audited value") || clicked.evidence?.screenshots?.length !== 2 || !clicked.evidence.screenshots[0]?.found) {
       throw new Error(`audited click failed: ${JSON.stringify(clicked)}`);
+    }
+    const undeclaredDialog = run([
+      "request", "--session", session, "--action", "click", "--selector", "#confirm",
+      "--label", "Dismiss undeclared fixture dialog", "--authorization", "local smoke fixture",
+    ]);
+    if (undeclaredDialog.ok || undeclaredDialog.errorCode !== "DIALOG_REQUIRED" || undeclaredDialog.interaction?.dialog?.handledAs !== "dismiss") {
+      throw new Error(`undeclared dialog was not safely rejected: ${JSON.stringify(undeclaredDialog)}`);
+    }
+    const acceptedDialog = run([
+      "request", "--session", session, "--action", "click", "--selector", "#confirm",
+      "--dialog", "accept", "--label", "Accept fixture dialog", "--authorization", "local smoke fixture",
+    ]);
+    if (!acceptedDialog.ok || acceptedDialog.interaction?.dialog?.handledAs !== "accept" || !acceptedDialog.result?.visibleText?.includes("confirmed")) {
+      throw new Error(`declared dialog acceptance failed: ${JSON.stringify(acceptedDialog)}`);
     }
     const waitedFor = run([
       "request", "--session", session, "--action", "wait-for", "--selector", "output",

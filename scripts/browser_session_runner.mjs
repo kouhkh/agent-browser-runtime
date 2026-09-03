@@ -42,6 +42,7 @@ function parseArgs(argv) {
     label: null,
     authorization: null,
     authBootstrap: false,
+    dialogAction: null,
     evidenceDir: null,
     files: [],
     waitAfterMs: 350,
@@ -69,6 +70,7 @@ function parseArgs(argv) {
     else if (arg === "--label") out.label = argv[++i];
     else if (arg === "--authorization") out.authorization = argv[++i];
     else if (arg === "--auth-bootstrap") out.authBootstrap = true;
+    else if (arg === "--dialog") out.dialogAction = argv[++i];
     else if (arg === "--evidence-dir") out.evidenceDir = argv[++i];
     else if (arg === "--file") out.files.push(argv[++i]);
     else if (arg === "--wait-after-ms") out.waitAfterMs = Math.max(0, Math.min(3000, Number(argv[++i] || 0)));
@@ -85,6 +87,9 @@ function parseArgs(argv) {
     throw new Error("Invalid session name; use 1-64 letters, numbers, _ or -");
   }
   if (out.value !== null && out.valueEnv) throw new Error("Use only one of --value or --value-env");
+  if (out.dialogAction && !["accept", "dismiss"].includes(out.dialogAction)) {
+    throw new Error("--dialog must be accept or dismiss");
+  }
   if (out.valueEnv) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(out.valueEnv)) throw new Error("--value-env must name one environment variable");
     if (!(out.valueEnv in process.env)) throw new Error(`Environment variable is not set: ${out.valueEnv}`);
@@ -264,6 +269,10 @@ class CdpClient {
     const handlers = this.listeners.get(method) || [];
     handlers.push(handler);
     this.listeners.set(method, handlers);
+    return () => {
+      const current = this.listeners.get(method) || [];
+      this.listeners.set(method, current.filter((item) => item !== handler));
+    };
   }
 
   once(method, timeoutMs, signal) {
@@ -786,7 +795,7 @@ class BrowserSession {
       } else if (action === "auth-check") {
         result = await this.navigate(body.url || this.state.auth?.checkUrl, body.waitUntil || "load", timeoutMs, controller.signal);
       } else if (action === "click") {
-        interaction = await this.click(body.selector, timeoutMs, controller.signal);
+        interaction = await this.click(body.selector, timeoutMs, controller.signal, body.dialogAction);
         await sleep(Math.max(0, Math.min(3000, Number(body.waitAfterMs ?? 350))));
         result = await this.readDom(timeoutMs, controller.signal);
       } else if (action === "fill") {
@@ -803,7 +812,19 @@ class BrowserSession {
         result = await this.inspect(timeoutMs, controller.signal);
       }
       operation.screenshots.push(await this.captureEvidence(operation, body, "after", timeoutMs, controller.signal));
-      if (action === "auth-check") {
+      if (interaction?.dialog?.automaticallyDismissed) {
+        response = {
+          ok: false,
+          status: "failed",
+          operationId,
+          elapsedMs: Date.now() - operation.startedAt,
+          errorCode: "DIALOG_REQUIRED",
+          error: `Browser dialog requires explicit --dialog accept|dismiss: ${interaction.dialog.message}`,
+          stale: false,
+          interaction,
+          result,
+        };
+      } else if (action === "auth-check") {
         const contains = body.contains || this.state.auth?.checkContains;
         const hasExpectedText = !contains || result?.visibleText?.includes(contains);
         const loginLike = typeof result?.url === "string" && /\/login(?:[/?#]|$)/i.test(result.url);
@@ -835,13 +856,14 @@ class BrowserSession {
             };
       }
     } catch (error) {
+      if (error?.interaction) interaction = error.interaction;
       const cancelled = controller.signal.aborted && !operation.timedOut;
       response = {
         ok: false,
         status: cancelled ? "cancelled" : operation.timedOut ? "timeout" : "failed",
         operationId,
         elapsedMs: Date.now() - operation.startedAt,
-        errorCode: cancelled ? "CANCELLED" : operation.timedOut ? "OPERATION_TIMEOUT" : "BROWSER_OPERATION_FAILED",
+        errorCode: cancelled ? "CANCELLED" : operation.timedOut ? "OPERATION_TIMEOUT" : error?.code || "BROWSER_OPERATION_FAILED",
         error: error instanceof Error ? error.message : String(error),
         stale: this.invalidated,
       };
@@ -872,6 +894,7 @@ class BrowserSession {
           visibleTextTotalChars: Number.isFinite(result.visibleTextTotalChars) ? result.visibleTextTotalChars : null,
           visibleTextTruncated: result.visibleTextTruncated === true,
         } : null,
+        interaction,
         network: operation.network,
         screenshots: operation.screenshots,
       };
@@ -1053,35 +1076,56 @@ class BrowserSession {
     return result;
   }
 
-  async click(selector, timeoutMs, signal) {
+  async click(selector, timeoutMs, signal, dialogAction = null) {
     if (typeof selector !== "string" || !selector.trim()) throw new Error("interaction requires --selector");
-    const target = await this.evaluate(`(() => {
-      const target = document.querySelector(${JSON.stringify(selector.trim())});
-      if (!target) return null;
-      target.scrollIntoView({ block: 'center', inline: 'center' });
-      const rect = target.getBoundingClientRect();
-      const details = {
-        x: rect.left + rect.width / 2,
-        y: rect.top + rect.height / 2,
-        disabled: Boolean(target.disabled),
-        tag: target.tagName,
-        type: target.getAttribute('type'),
-        mode: 'dom_click',
+    let dialog = null;
+    let dialogHandling = Promise.resolve();
+    const unsubscribe = this.cdp.on("Page.javascriptDialogOpening", (event) => {
+      if (dialog) return;
+      const requestedAction = dialogAction || "dismiss";
+      dialog = {
+        type: String(event.type || "unknown"),
+        message: String(event.message || "").slice(0, 1000),
+        requestedAction: dialogAction || null,
+        handledAs: requestedAction,
+        automaticallyDismissed: !dialogAction,
       };
-      if (details.disabled) return details;
-      if (typeof target.focus === 'function') target.focus({ preventScroll: true });
-      target.click();
-      return details;
-    })()`, timeoutMs, signal);
-    if (!target) throw new Error(`No element matches selector: ${selector}`);
-    if (target.disabled) throw new Error(`Target is disabled: ${selector}`);
-    return target;
+      dialogHandling = this.cdp.send("Page.handleJavaScriptDialog", {
+        accept: requestedAction === "accept",
+      }, timeoutMs, signal);
+    });
+    try {
+      const target = await this.evaluate(`(() => {
+        const target = document.querySelector(${JSON.stringify(selector.trim())});
+        if (!target) return null;
+        target.scrollIntoView({ block: 'center', inline: 'center' });
+        const rect = target.getBoundingClientRect();
+        const details = {
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+          disabled: Boolean(target.disabled),
+          tag: target.tagName,
+          type: target.getAttribute('type'),
+          mode: 'dom_click',
+        };
+        if (details.disabled) return details;
+        if (typeof target.focus === 'function') target.focus({ preventScroll: true });
+        target.click();
+        return details;
+      })()`, timeoutMs, signal);
+      await dialogHandling;
+      if (!target) throw new Error(`No element matches selector: ${selector}`);
+      if (target.disabled) throw new Error(`Target is disabled: ${selector}`);
+      return { ...target, dialog };
+    } finally {
+      unsubscribe();
+    }
   }
 
   async fill(selector, value, timeoutMs, signal) {
     if (typeof value !== "string") throw new Error("fill requires --value");
     const target = await this.targetCenter(selector, timeoutMs, signal);
-    await this.click(selector, timeoutMs, signal);
+    await this.click(selector, timeoutMs, signal, null);
     const result = await this.evaluate(`(() => {
       const target = document.querySelector(${JSON.stringify(selector.trim())});
       if (!target) return null;
@@ -1316,7 +1360,7 @@ function printHelp() {
   browser_session_runner.mjs request --shared --session NAME --action inspect [--timeout-ms N]
   browser_session_runner.mjs request --shared --session NAME --action screenshot [--selector CSS] [--label TEXT]
   browser_session_runner.mjs request --shared --session NAME --action wait-for [--selector CSS] [--contains TEXT]
-  browser_session_runner.mjs request --shared --session NAME --action click --selector CSS --label TEXT --authorization SCOPE
+  browser_session_runner.mjs request --shared --session NAME --action click --selector CSS --label TEXT --authorization SCOPE [--dialog accept|dismiss]
   browser_session_runner.mjs request --shared --session NAME --action fill --selector CSS (--value TEXT | --value-env NAME) --label TEXT --authorization SCOPE
   browser_session_runner.mjs request --shared --session NAME --action upload --selector CSS --file /ABSOLUTE/PATH --label TEXT --authorization SCOPE
   browser_session_runner.mjs request --shared --session NAME --action auth-status
@@ -1362,6 +1406,7 @@ async function main() {
       label: options.label,
       authorization: options.authorization,
       authBootstrap: options.authBootstrap,
+      dialogAction: options.dialogAction,
       files: options.files,
       waitAfterMs: options.waitAfterMs,
     });

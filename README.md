@@ -85,6 +85,9 @@ uncapped character count and a truncation flag so callers can request narrower e
 instead of flooding agent context.
 Normal controls are activated with a bounded native DOM click after selector and disabled
 checks. Coordinate gestures are not silently emulated by the ordinary click action.
+Browser-native dialogs are dismissed safely unless the caller declares `--dialog accept`
+or `--dialog dismiss`; an undeclared dialog returns `DIALOG_REQUIRED`, including its text
+and recorded handling, instead of consuming the operation timeout.
 
 ## Shared sign-in session
 
